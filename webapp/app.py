@@ -1,4 +1,5 @@
-"""传感器入库排查页：浏览器上传 SQLite 副本，只读执行 SELECT/WITH 查询。"""
+"""传感器入库排查页：浏览器上传 SQLite 副本，只读执行 SELECT/WITH 查询，
+并可在隔离副本上演练 DELETE（含触发器/外键影响）。"""
 from __future__ import annotations
 
 import os
@@ -12,6 +13,7 @@ import uuid
 from flask import Flask, jsonify, render_template, request, send_file, session
 
 from query_manager import QueryManager
+from rehearsal_manager import RehearsalManager, find_virtual_tables, main_statement_keyword
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(REPO_ROOT, "uploads"))
@@ -26,10 +28,22 @@ app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "300")) *
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
+# 只读查询与 DELETE 演练共享同一组执行名额（合计最多 MAX_CONCURRENT 项）
+_exec_slots = threading.BoundedSemaphore(int(os.environ.get("MAX_CONCURRENT", "2")))
+
 manager = QueryManager(
     max_concurrent=int(os.environ.get("MAX_CONCURRENT", "2")),
     timeout=float(os.environ.get("QUERY_TIMEOUT", "3")),
     max_rows=int(os.environ.get("MAX_ROWS", "1000")),
+    slots=_exec_slots,
+)
+
+rehearsals = RehearsalManager(
+    slots=_exec_slots,
+    timeout=float(os.environ.get("QUERY_TIMEOUT", "3")),
+    sample_limit=int(os.environ.get("REHEARSAL_SAMPLE_LIMIT", "20")),
+    max_snapshot_rows=int(os.environ.get("REHEARSAL_MAX_SNAPSHOT_ROWS", "2000000")),
+    work_dir=UPLOAD_DIR,
 )
 
 _UID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -92,6 +106,7 @@ def index():
         max_rows=manager.max_rows,
         timeout=manager.timeout,
         max_concurrent=manager.max_concurrent,
+        sample_limit=rehearsals.sample_limit,
     )
 
 
@@ -236,8 +251,8 @@ def start_query():
         return (
             jsonify(
                 {
-                    "error": f"查询位已满：最多同时运行 {manager.max_concurrent} 条查询，"
-                    "请等待其完成或先取消进行中的查询"
+                    "error": f"执行位已满：查询与演练合计最多同时运行 {manager.max_concurrent} 项，"
+                    "请等待其完成或先取消进行中的任务"
                 }
             ),
             429,
@@ -261,25 +276,97 @@ def query_cancel(job_id):
     return jsonify(job.public())
 
 
+# ---------------- DELETE 演练（隔离副本） ----------------
+
+@app.post("/rehearsal")
+def start_rehearsal():
+    path = _current_db()
+    if not path:
+        return jsonify({"error": "尚未上传数据库副本"}), 400
+    data = request.get_json(silent=True) or {}
+    sql = (data.get("sql") or "").strip()
+    if not sql:
+        return jsonify({"error": "SQL 不能为空"}), 400
+    if len(sql) > 100_000:
+        return jsonify({"error": "SQL 过长（>100KB）"}), 400
+    kw = main_statement_keyword(sql)
+    if kw != "DELETE":
+        return (
+            jsonify(
+                {
+                    "error": "演练仅支持 DELETE 语句（可带 WITH），"
+                    f"检测到主语句：{kw or '无法解析'}"
+                }
+            ),
+            400,
+        )
+    try:
+        vtables = find_virtual_tables(path)
+    except sqlite3.Error as exc:
+        return jsonify({"error": f"无法读取数据库结构：{exc}"}), 400
+    if vtables:
+        return (
+            jsonify(
+                {
+                    "error": "演练仅支持普通表、视图和触发器；当前库包含虚拟表（"
+                    + "、".join(vtables)
+                    + "），已拒绝"
+                }
+            ),
+            400,
+        )
+    job = rehearsals.submit(path, sql)
+    if job is None:
+        return (
+            jsonify(
+                {
+                    "error": f"执行位已满：查询与演练合计最多同时运行 {manager.max_concurrent} 项，"
+                    "请等待其完成或先取消进行中的任务"
+                }
+            ),
+            429,
+        )
+    return jsonify({"job_id": job.id})
+
+
+@app.get("/rehearsal/<job_id>")
+def rehearsal_status(job_id):
+    job = rehearsals.get(job_id)
+    if job is None:
+        return jsonify({"error": "演练不存在或已过期"}), 404
+    return jsonify(job.public())
+
+
+@app.post("/rehearsal/<job_id>/cancel")
+def rehearsal_cancel(job_id):
+    job = rehearsals.cancel_and_wait(job_id)
+    if job is None:
+        return jsonify({"error": "演练不存在或已过期"}), 404
+    return jsonify(job.public())
+
+
 @app.errorhandler(413)
 def too_large(_e):
     return jsonify({"error": "文件过大，超过上传限制"}), 413
 
 
 def _upload_reaper():
-    """定期清理超过 TTL 的上传副本，避免卷内文件无限堆积。"""
+    """定期清理超过 TTL 的上传副本与演练残留目录，避免卷内文件无限堆积。"""
     ttl = int(os.environ.get("UPLOAD_TTL_HOURS", "24")) * 3600
     while True:
         time.sleep(1800)
         try:
             now = time.time()
             for name in os.listdir(UPLOAD_DIR):
-                if not name.endswith(".db"):
-                    continue
                 path = os.path.join(UPLOAD_DIR, name)
                 try:
-                    if now - os.path.getmtime(path) > ttl:
-                        os.remove(path)
+                    if name.endswith(".db") and os.path.isfile(path):
+                        if now - os.path.getmtime(path) > ttl:
+                            os.remove(path)
+                    elif name.startswith("rehearsal-") and os.path.isdir(path):
+                        # 正常演练在落定终态前已删除临时目录；这里只兜底异常残留
+                        if now - os.path.getmtime(path) > ttl:
+                            shutil.rmtree(path, ignore_errors=True)
                 except OSError:
                     pass
         except Exception:

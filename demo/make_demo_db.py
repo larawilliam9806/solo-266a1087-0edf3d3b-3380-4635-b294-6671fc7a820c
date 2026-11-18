@@ -5,6 +5,10 @@
 导致同一 (sensor_id, ts) 被重复写入（多数 2 条，个别 3 条），
 value 有微小抖动、batch_id / ingested_at 不同 —— 典型的"重复采样"现场。
 
+库内还带有一个 AFTER DELETE 触发器（把被删采样归档到 sample_audit），
+用于在 DELETE 演练中观察触发器影响；sensor_samples.sensor_id 引用
+sensors.sensor_id，可用于演示外键约束失败。
+
 用法：python3 make_demo_db.py [输出路径]   （默认写到本脚本同目录）
 """
 import math
@@ -33,6 +37,23 @@ CREATE TABLE sensor_samples (
 
 CREATE INDEX idx_samples_sensor_ts ON sensor_samples(sensor_id, ts);
 CREATE INDEX idx_samples_batch     ON sensor_samples(batch_id);
+
+-- 删除审计：演练 DELETE 时由触发器自动写入，用于观察"触发器影响"
+CREATE TABLE sample_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id  INTEGER NOT NULL,
+    sensor_id  TEXT NOT NULL,
+    ts         TEXT NOT NULL,
+    value      REAL NOT NULL,
+    batch_id   TEXT NOT NULL,
+    deleted_at TEXT NOT NULL
+);
+
+CREATE TRIGGER trg_samples_archive AFTER DELETE ON sensor_samples
+BEGIN
+    INSERT INTO sample_audit (sample_id, sensor_id, ts, value, batch_id, deleted_at)
+    VALUES (OLD.id, OLD.sensor_id, OLD.ts, OLD.value, OLD.batch_id, datetime('now'));
+END;
 """
 
 # sensor_id, 位置, 指标, 单位, 基线, 振幅

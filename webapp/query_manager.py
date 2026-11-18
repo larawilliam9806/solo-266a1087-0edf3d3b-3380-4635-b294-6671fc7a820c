@@ -1,7 +1,8 @@
 """只读 SQL 查询执行器。
 
 设计要点（对应排查页需求）：
-- 最多 N 条并发查询（信号量名额），满额时 submit() 返回 None，由上层明确拒绝；
+- 最多 N 条并发执行（信号量名额，可与演练执行器共享同一组名额），
+  满额时 submit() 返回 None，由上层明确拒绝；
 - 每条查询独立只读连接（file:...?mode=ro），并设置 authorizer 只放行 SELECT 所需动作，
   禁止 ATTACH / PRAGMA / 写操作 / load_extension，扩展加载同时被显式关闭；
 - 超时由定时器触发 conn.interrupt() 实现，用户取消走同一路径 —— 真正中断 SQLite 计算，
@@ -115,12 +116,13 @@ class Job:
 
 
 class QueryManager:
-    def __init__(self, max_concurrent=2, timeout=3.0, max_rows=1000, job_ttl=600):
+    def __init__(self, max_concurrent=2, timeout=3.0, max_rows=1000, job_ttl=600, slots=None):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.max_rows = max_rows
         self.job_ttl = job_ttl
-        self._slots = threading.BoundedSemaphore(max_concurrent)
+        # 执行名额信号量：可由上层注入以便与演练等其他执行器共享同一组名额
+        self._slots = slots if slots is not None else threading.BoundedSemaphore(max_concurrent)
         self._jobs = {}
         self._lock = threading.Lock()
 

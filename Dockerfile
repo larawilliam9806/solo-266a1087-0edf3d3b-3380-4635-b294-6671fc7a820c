@@ -28,6 +28,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=4s --start-period=10s \
   CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)" || exit 1
 
-# 单 worker 多线程：查询名额在进程内用信号量控制，必须保持单 worker
+# 单 worker 多线程：执行名额（查询+演练共享）在进程内用信号量控制，必须保持单 worker
 CMD ["gunicorn", "--pythonpath", "/app/webapp", "--bind", "0.0.0.0:8000", \
      "--workers", "1", "--threads", "16", "--timeout", "30", "app:app"]

@@ -52,7 +52,7 @@
 <body>
 <header>
   <h1>传感器入库排查 · 只读 SQL 工作台</h1>
-  <span class="sub">只读执行 SELECT / WITH · 最多 {{ max_concurrent }} 条并发 · 超过 {{ timeout }}s 自动终止 · 最多显示 {{ max_rows }} 行</span>
+  <span class="sub">只读执行 SELECT / WITH · DELETE 演练在隔离副本上运行（外键 + 触发器生效）· 查询与演练合计最多 {{ max_concurrent }} 项并发 · 超过 {{ timeout }}s 自动终止 · 查询最多显示 {{ max_rows }} 行</span>
 </header>
 <main>
   <section class="card">
@@ -90,10 +90,29 @@
     <div id="banner" class="banner"></div>
     <div id="resultBox"></div>
   </section>
+
+  <section class="card" id="rehearsalCard" style="display:none">
+    <h2>④ DELETE 演练 <span class="muted" style="font-weight:normal">（在隔离副本上执行，启用外键并执行原有触发器，上传原件不受影响）</span></h2>
+    <div class="row examples" style="margin-bottom:8px">
+      <span class="muted">示例：</span>
+      <button data-rex="dedup">去重 DELETE（含触发器审计）</button>
+      <button data-rex="fk">外键约束失败</button>
+      <button data-rex="slow">慢演练（演示超时）</button>
+    </div>
+    <textarea id="rsql" spellcheck="false" placeholder="DELETE FROM ... -- 仅允许 DELETE（可带 WITH）"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button id="rrunBtn">开始演练</button>
+      <button id="rcancelBtn" class="danger" disabled>取消演练</button>
+      <span id="rStatus" class="muted"></span>
+    </div>
+    <div id="rbanner" class="banner"></div>
+    <div id="rresultBox"></div>
+  </section>
 </main>
 
 <script>
 const MAX_ROWS = {{ max_rows }};
+const SAMPLE_LIMIT = {{ sample_limit }};
 const EXAMPLES = {
   dup: `-- 重复采样汇总：同一传感器同一秒出现多条记录
 SELECT sensor_id, ts, COUNT(*) AS n, GROUP_CONCAT(id) AS sample_ids
@@ -127,8 +146,29 @@ WITH RECURSIVE cnt(x) AS (
 SELECT COUNT(*) AS n, SUM(x) AS total FROM cnt;`
 };
 
+const REHEARSAL_EXAMPLES = {
+  dedup: `-- 去重演练：每组重复采样保留最小 id，删除其余行
+-- 触发器 trg_samples_archive 会把被删行归档到 sample_audit（计入报告）
+WITH ranked AS (
+  SELECT id, ROW_NUMBER() OVER (PARTITION BY sensor_id, ts ORDER BY id) AS rn
+  FROM sensor_samples
+)
+DELETE FROM sensor_samples WHERE id IN (SELECT id FROM ranked WHERE rn > 1);`,
+  fk: `-- 外键约束演示：sensors 被 sensor_samples 引用，启用外键后删除将失败
+-- 演练会丢弃全部变更，不返回部分报告
+DELETE FROM sensors;`,
+  slow: `-- 慢演练：递归 CTE 拖慢 DELETE，用于演示 3 秒自动终止与取消
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 300000000
+)
+DELETE FROM sensor_samples WHERE id IN (SELECT x FROM cnt);`
+};
+
 const $ = id => document.getElementById(id);
 let currentJob = null, pollTimer = null;
+let currentRehearsal = null, rehearsalPollTimer = null;
 
 async function api(method, url, body) {
   const opt = { method, headers: {} };
@@ -144,14 +184,16 @@ function setDbStatus(msg) { $('dbStatus').textContent = msg; }
 async function refreshCurrent() {
   const { body } = await api('GET', '/api/current');
   if (body.loaded) {
-    setDbStatus(`已加载副本（${(body.size/1024).toFixed(1)} KB）。所有查询均为只读，不影响原库。`);
+    setDbStatus(`已加载副本（${(body.size/1024).toFixed(1)} KB）。查询为只读；DELETE 演练在隔离副本上进行，均不影响原件。`);
     $('schemaCard').style.display = '';
     $('queryCard').style.display = '';
+    $('rehearsalCard').style.display = '';
     loadSchema();
   } else {
     setDbStatus('尚未加载数据库。');
     $('schemaCard').style.display = 'none';
     $('queryCard').style.display = 'none';
+    $('rehearsalCard').style.display = 'none';
   }
 }
 
@@ -178,6 +220,7 @@ $('resetBtn').onclick = async () => {
   setDbStatus('副本已清除。');
   $('schemaCard').style.display = 'none';
   $('queryCard').style.display = 'none';
+  $('rehearsalCard').style.display = 'none';
 };
 
 async function loadSchema() {
@@ -299,6 +342,136 @@ function renderTable(box, cols, rows) {
   for (const row of rows) {
     const r = document.createElement('tr');
     for (const v of row) { const td = document.createElement('td'); td.textContent = v === null ? 'NULL' : String(v); if (v===null) td.style.color='var(--dim)'; r.append(td); }
+    t.append(r);
+  }
+  wrap.append(t);
+  box.append(wrap);
+}
+
+// ---------------- DELETE 演练 ----------------
+
+document.querySelectorAll('.examples button[data-rex]').forEach(b => {
+  b.onclick = () => { $('rsql').value = REHEARSAL_EXAMPLES[b.dataset.rex]; };
+});
+
+function rbanner(kind, msg) {
+  const b = $('rbanner');
+  b.className = 'banner show ' + kind;
+  b.textContent = msg;
+}
+function clearRbanner() { const b = $('rbanner'); b.className = 'banner'; b.textContent = ''; }
+
+$('rrunBtn').onclick = async () => {
+  const sql = $('rsql').value.trim();
+  if (!sql) { rbanner('err', 'SQL 不能为空'); return; }
+  clearRbanner();
+  $('rresultBox').innerHTML = '';
+  const { status, body } = await api('POST', '/rehearsal', { sql });
+  if (status === 429) { rbanner('warn', body.error); return; }
+  if (status !== 200) { rbanner('err', body.error || ('请求失败 ' + status)); return; }
+  currentRehearsal = body.job_id;
+  setRehearsalRunning(true);
+  pollRehearsal();
+};
+
+$('rcancelBtn').onclick = async () => {
+  if (!currentRehearsal) return;
+  $('rcancelBtn').disabled = true;
+  $('rStatus').textContent = '正在取消…';
+  const { body } = await api('POST', `/rehearsal/${currentRehearsal}/cancel`);
+  renderRehearsalFinal(body);   // 后端返回时工作已停止、变更已丢弃、名额已释放
+};
+
+function setRehearsalRunning(on) {
+  $('rrunBtn').disabled = on;
+  $('rcancelBtn').disabled = !on;
+  if (on) $('rStatus').textContent = '演练中…';
+}
+
+async function pollRehearsal() {
+  if (!currentRehearsal) return;
+  const { status, body } = await api('GET', `/rehearsal/${currentRehearsal}`);
+  if (status !== 200) { rbanner('err', body.error || '演练状态获取失败'); finishRehearsal(); return; }
+  $('rStatus').textContent = `演练中… ${(body.elapsed_ms/1000).toFixed(1)}s`;
+  if (['done','error','timeout','cancelled'].includes(body.status)) { renderRehearsalFinal(body); return; }
+  rehearsalPollTimer = setTimeout(pollRehearsal, 250);
+}
+
+function finishRehearsal() {
+  currentRehearsal = null;
+  if (rehearsalPollTimer) { clearTimeout(rehearsalPollTimer); rehearsalPollTimer = null; }
+  setRehearsalRunning(false);
+}
+
+function renderRehearsalFinal(j) {
+  finishRehearsal();
+  const box = $('rresultBox');
+  box.innerHTML = '';
+  const secs = (j.elapsed_ms/1000).toFixed(2);
+  if (j.status === 'done') {
+    $('rStatus').textContent = `演练完成，用时 ${secs}s`;
+    rbanner('ok', `演练成功（隔离副本，用时 ${secs}s）。以下为前后对比，上传原件未做任何修改。`);
+    renderReport(box, j.report);
+  } else if (j.status === 'timeout') {
+    $('rStatus').textContent = '';
+    rbanner('warn', `演练超过 ${secs}s 已被自动终止：实际工作已停止，全部变更已丢弃，未生成报告。`);
+  } else if (j.status === 'cancelled') {
+    $('rStatus').textContent = '';
+    rbanner('warn', `演练已取消（${secs}s）：实际工作已停止，全部变更已丢弃，未生成报告。`);
+  } else {
+    $('rStatus').textContent = '';
+    rbanner('err', '演练失败（全部变更已丢弃，未生成报告）：' + (j.error || '未知错误'));
+  }
+}
+
+function renderReport(box, report) {
+  box.append(el('p', '', `对比口径：值类型 + 完整行 + 重复次数（更新计为删旧行 + 增新行，含触发器影响）。` +
+    `共 ${report.table_count} 张用户表，${report.changed_tables} 张有变化；DELETE 语句直接删除 ${report.delete_rowcount} 行。`));
+  const unchanged = [];
+  for (const t of report.tables) {
+    if (!t.deleted_count && !t.added_count) { unchanged.push(t.name); continue; }
+    const d = document.createElement('details');
+    d.className = 'tbl';
+    d.open = true;
+    const s = document.createElement('summary');
+    s.append(el('b', '', `${t.name} `),
+             el('span', 'muted', ` ${t.row_count_before} → ${t.row_count_after} 行 · `),
+             el('span', '', `删除 ${t.deleted_count} · 新增 ${t.added_count}`));
+    d.append(s);
+    const bodyDiv = document.createElement('div'); bodyDiv.className = 'body';
+    if (t.deleted_count) {
+      bodyDiv.append(el('p', 'muted', `删除的行（样例最多 ${SAMPLE_LIMIT} 条${t.deleted_samples_truncated ? '，不同行过多已截断' : ''}）：`));
+      renderSampleTable(bodyDiv, t.columns, t.deleted_samples);
+    }
+    if (t.added_count) {
+      bodyDiv.append(el('p', 'muted', `新增的行（含触发器写入，样例最多 ${SAMPLE_LIMIT} 条${t.added_samples_truncated ? '，不同行过多已截断' : ''}）：`));
+      renderSampleTable(bodyDiv, t.columns, t.added_samples);
+    }
+    d.append(bodyDiv);
+    box.append(d);
+  }
+  if (unchanged.length) box.append(el('p', 'muted', '无变化的表：' + unchanged.join('、')));
+}
+
+function renderSampleTable(box, cols, samples) {
+  const wrap = document.createElement('div'); wrap.className = 'tblwrap';
+  const t = document.createElement('table'); t.className = 'result';
+  const hr = document.createElement('tr');
+  for (const c of [...cols, '重复次数']) { const th = document.createElement('th'); th.textContent = c; hr.append(th); }
+  t.append(hr);
+  for (const s of samples) {
+    const r = document.createElement('tr');
+    for (let i = 0; i < s.values.length; i++) {
+      const td = document.createElement('td');
+      const v = s.values[i];
+      td.textContent = v === null ? 'NULL' : String(v);
+      if (v === null) td.style.color = 'var(--dim)';
+      td.title = s.types[i];   // 值类型（INTEGER/REAL/TEXT/BLOB/NULL）
+      r.append(td);
+    }
+    const td = document.createElement('td');
+    td.textContent = '×' + s.count;
+    r.append(td);
     t.append(r);
   }
   wrap.append(t);
